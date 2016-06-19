@@ -22,12 +22,38 @@ var GIT_CONFIG = null;
 
 var github;
 
+var millisecondsPerDay = 86400000; // 24 * 60 * 60 * 1000
+
 // Try and get the .gitconfig.
 try {
   GIT_CONFIG = iniparser.parseSync(GIT_CONFIG_PATH);
 } catch (err) {
   // Passthrough.
 }
+
+var filterFreshItems = function (items, cutoff) {
+  return _.filter(items, function (item) {
+    return new Date(item.updated_at) > cutoff;
+  });
+};
+
+var formatReposFilter = function (repos) {
+  var result = {};
+
+  _.each(repos, function (repo) {
+    var parts = repo.split("/", 2);
+    var org = parts[0];
+    var repoName = parts[1];
+
+    if (!result[org]) {
+      result[org] = [];
+    }
+
+    result[org].push({"name": repoName});
+  });
+
+  return result;
+};
 
 /**
  * Get Items for organization (PRs or Issues).
@@ -44,11 +70,15 @@ var getItems = function (opts, callback) {
   // Actions.
   async.auto({
     repos: function (cb) {
-      github.repos.getFromOrg({
-        type: opts.repoType,
-        org: opts.org,
-        per_page: 100 // eslint-disable-line camelcase
-      }, cb);
+      if (opts.org in opts.repos) {
+        return cb(false, opts.repos[opts.org]);
+      } else {
+        github.repos.getFromOrg({
+          type: opts.repoType,
+          org: opts.org,
+          per_page: 100 // eslint-disable-line camelcase
+        }, cb);
+      }
     },
 
     items: ["repos", function (cb, results) {
@@ -73,7 +103,11 @@ var getItems = function (opts, callback) {
             }, function (err, items) {
               if (items && items.length) {
                 delete items.meta;
-                repos[repo.name].items = items;
+                if (opts.cutoff === null || opts.cutoff === undefined) {
+                  repos[repo.name].items = items;
+                } else {
+                  repos[repo.name].items = filterFreshItems(items, opts.cutoff);
+                }
               }
 
               return typeCb(err);
@@ -92,7 +126,11 @@ var getItems = function (opts, callback) {
             }, function (err, items) {
               if (items && items.length) {
                 delete items.meta;
-                repos[repo.name].items = items;
+                if (opts.cutoff === null) {
+                  repos[repo.name].items = items;
+                } else {
+                  repos[repo.name].items = filterFreshItems(items, opts.cutoff);
+                }
               }
 
               return typeCb(err);
@@ -112,16 +150,12 @@ var getItems = function (opts, callback) {
 
     var repos = {};
     var entUrlRe = /api\/v[0-9]\/repos\//;
-    var orgUrl = null;
 
     // Iterate Repos.
     _.chain(results.items)
       .filter(function (repo) { return repo.items && repo.items.length; })
       .sort(function (repo) { return repo.name; })
       .map(function (repo) {
-        // Add in owner URL.
-        orgUrl = orgUrl || repo.owner.html_url;
-
         // Starting data.
         var repoData = {
           name: repo.name,
@@ -151,7 +185,10 @@ var getItems = function (opts, callback) {
               assignee: pr.assignee ? pr.assignee.login : null,
               number: pr.number,
               title: pr.title,
-              url: program.prUrl || program.html ? url : null
+              url: program.prUrl || program.html ? url : null,
+              htmlUrl: pr.html_url,
+              createdAt: pr.created_at,
+              updatedAt: pr.updated_at
             };
           })
           .filter(function (pr) {
@@ -168,10 +205,8 @@ var getItems = function (opts, callback) {
         }
       });
 
-    // Piggy back owner url off first PR.
     callback(null, {
       org: opts.org,
-      orgUrl: orgUrl,
       repos: repos
     });
   });
@@ -194,11 +229,13 @@ if (require.main === module) {
 
     .option("-o, --org [orgs]", "Comma-separated list of 1+ organizations", list)
     .option("-u, --user [users]", "Comma-separated list of 0+ users", list)
+    .option("-r, --repo [repos]", "Comma-separated list of 0+ repos", list)
     .option("-H, --host <name>", "GitHub Enterprise API host URL")
     .option("-s, --state <state>", "State of issues (default: open)", "open")
     .option("-i, --insecure", "Allow unauthorized TLS (for proxies)", false)
     .option("-t, --tmpl <path>", "Handlebars template path")
     .option("--html", "Display report as HTML", false)
+    .option("--yaml", "Display report as YAML", false)
     .option("--gh-user <username>", "GitHub user name", null)
     .option("--gh-pass <password>", "GitHub pass", null)
     .option("--gh-token <token>", "GitHub token", null)
@@ -206,6 +243,8 @@ if (require.main === module) {
     .option("--repo-type <type>", "Repo type (default: all|member|private)", "all")
     .option("--issue-type [types]",
       "Comma-separated list of issue types (default: pull-request|issue)", list)
+    .option("-m, --min-unupdated-days <num-days>",
+      "Filter for items that have not been updated in this many days", null)
     .parse(process.argv);
 
   // Add defaults from configuration, in order of precendence.
@@ -261,6 +300,8 @@ if (require.main === module) {
   var tmplPath = path.join(__dirname, "templates/text.hbs");
   if (program.html) {
     tmplPath = path.join(__dirname, "templates/html.hbs");
+  } else if (program.yaml) {
+    tmplPath = path.join(__dirname, "templates/yaml.hbs");
   } else if (program.tmpl) {
     tmplPath = program.tmpl;
   }
@@ -324,12 +365,21 @@ if (require.main === module) {
   // Iterate PRs for Organizations.
   // --------------------------------------------------------------------------
   // Get PRs for each org in parallel, then display in order.
+
+  var repos = formatReposFilter(program.repo);
+  var cutoff = null;
+  if (program.minUnupdatedDays !== null && program.minUnupdatedDays !== undefined) {
+    cutoff = new Date(new Date() - program.minUnupdatedDays * millisecondsPerDay);
+  }
+
   async.map(program.org, function (org, cb) {
     getItems({
       repoType: program.repoType,
       org: org,
+      repos: repos,
       pullRequests: program.issueType.indexOf("pull-request") > NOT_FOUND,
       issues: program.issueType.indexOf("issue") > NOT_FOUND,
+      cutoff: cutoff,
       users: program.user,
       state: program.state
     }, cb);

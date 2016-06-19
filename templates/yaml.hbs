@@ -1,0 +1,8 @@
+{{#each this~}}
+{{org}}:{{~#each repos}}
+  {{name}}:{{#each items}}
+    - title: {{{title}}}
+      url: {{htmlUrl}}
+      created_at: {{createdAt}}
+      updated_at: {{updatedAt}}{{/each}}{{/each}}
+{{/each~}}
