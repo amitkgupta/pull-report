@@ -306,6 +306,9 @@ if (require.main === module) {
     tmplPath = program.tmpl;
   }
 
+  handlebars.registerHelper('escape', function(variable) {
+    return variable.replace(/"/g, '\\"');
+  });
   var tmplStr = fs.readFileSync(tmplPath).toString();
   var tmpl = handlebars.compile(tmplStr);
 
